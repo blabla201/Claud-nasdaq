@@ -153,9 +153,18 @@ def oos(res, frac=0.6):
 def score(df, best_sharpe):
     c, last = df.Close, df.iloc[-1]
     r, add = [], lambda t, p: r.append((t, p))
-    add("Fiyat EMA9 üzerinde", 15) if last.Close > last.e9 else add("Fiyat EMA9 altında", -10)
-    add("EMA9 > EMA21 (kısa trend yukarı)", 15) if last.e9 > last.e21 else add("EMA9 < EMA21 (trend zayıf)", -10)
-    add("Fiyat 20g VWAP üzerinde", 15) if last.Close > last.vw else add("Fiyat VWAP altında", -10)
+    if last.Close > last.e9:
+        add('Fiyat EMA9 üzerinde', 15)
+    else:
+        add('Fiyat EMA9 altında', -10)
+    if last.e9 > last.e21:
+        add('EMA9 > EMA21 (kısa trend yukarı)', 15)
+    else:
+        add('EMA9 < EMA21 (trend zayıf)', -10)
+    if last.Close > last.vw:
+        add('Fiyat 20g VWAP üzerinde', 15)
+    else:
+        add('Fiyat VWAP altında', -10)
     r20 = c.iloc[-1] / c.iloc[-21] - 1
     add(f"20 günlük getiri %{r20*100:+.1f}", 20 if r20 > .08 else 10 if r20 > 0 else -10)
     R = last.rsi
@@ -164,10 +173,16 @@ def score(df, best_sharpe):
     elif R < 30: add(f"RSI {R:.0f}: aşırı satım, tepki olası", 5)
     else: add(f"RSI {R:.0f}: nötr/zayıf", 0)
     vr = df.Volume.tail(5).mean() / df.Volume.tail(20).mean()
-    add(f"Hacim ortalamanın {vr:.1f} katı", 10) if vr > 1.2 else add(f"Hacim normal ({vr:.1f}x)", 0)
+    if vr > 1.2:
+        add(f'Hacim ortalamanın {vr:.1f} katı', 10)
+    else:
+        add(f'Hacim normal ({vr:.1f}x)', 0)
     tl = trendline(df)
     if tl and tl["broken"]: add("Düşen trend çizgisi son 5 günde yukarı kırıldı", 10)
-    add(f"Veri dışı testte strateji Sharpe {best_sharpe:.1f}", 10) if best_sharpe > .8 else add("Veri dışı testte strateji zayıf", -5)
+    if best_sharpe > 0.8:
+        add(f'Veri dışı testte strateji Sharpe {best_sharpe:.1f}', 10)
+    else:
+        add('Veri dışı testte strateji zayıf', -5)
     return float(np.clip(50 + sum(p for _, p in r) / 1.5, 0, 100)), r
 
 def _breakout(df, look=10):
@@ -682,7 +697,8 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", p
             bt = run_all(df, cost)
             o = oos(bt)
             sc, why = score(df, o["test_sh"])
-            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr), trend=trendline(df))
+            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr), trend=trendline(df),
+                       ts=time.strftime("%d.%m %H:%M UTC", time.gmtime()))
         except Exception:
             continue
     if use_earn:
@@ -822,7 +838,7 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Back
 
 # ---------- 1) Sinyal ----------
 with t1:
-    L = sorted(A.items(), key=lambda x: -x[1]["score"])
+    L = sorted(A.items(), key=lambda x: (x[1]["plan"]["kind"] != "AL", -x[1]["score"]))
     (st.success if MKT[0] else st.warning)("📊 Piyasa: " + MKT[1])
     st.subheader("🎯 Bugünün önerisi")
     picks = []
@@ -850,6 +866,7 @@ with t1:
                 st.caption(f"Skor {a2['score']:.0f} · Lot: {lots(capital, risk, p_, frac)} · {p_['max_days']} işlem günü içinde hedefe gitmezse çıkın.")
     if not picks:
         st.info("Bugün alınacak güçlü aday yok. Beklemek de bir karardır; program yeni aday bulunca uyarır.")
+    st.caption("Fiyatlar Yahoo Finance’ten gelir (yaklaşık 15 dk gecikmeli); aracı kurum fiyatından birkaç sent farklı olabilir. Alış ve stop rakamları yalnızca alım önerisi olan hisselerde gösterilir.")
     st.caption(f"🛑 Günlük zarar limiti: {f(capital * 0.05)} (sermayenin %5’i). Ulaşırsanız o gün işlemi bırakın; kaybı kovalamak sermayeyi en hızlı eriten şeydir.")
     if SG:
         S_ = SG["stats"]
@@ -879,21 +896,29 @@ with t1:
         p = a["plan"]
         icon = "🟢" if p["kind"] == "AL" else "🟡" if p["kind"] == "IZLE" else "🔴"
         with st.expander(f"{icon} {s} · {f(p['price'])} · skor {a['score']:.0f} · {p['label']}", expanded=p["kind"] == "AL"):
-            c = st.columns(4)
-            c[0].metric("Kırılım noktası", f(p["hh"]))
-            c[1].metric("Alış noktası", f(p["entry"]))
-            c[2].metric("Stop noktası", f(p["stop"]), pc(p["stop"] / p["entry"] - 1))
-            c[3].metric("Hedef 2R / 3R", f(p["t1"]), f(p["t2"]), delta_color="off")
-            q = lots(capital, risk, p, frac)
-            st.caption(f"Hisse başı risk {f(p['R'])} (%{p['R']/p['entry']*100:.1f}) · Lot: **{q}** · "
-                       f"Maks. kayıp ≈ ${q*p['R']:,.0f} · Pozisyon büyüklüğü ≈ ${q*p['entry']:,.0f}")
-            if p["stage"] == "extended":
-                st.info(f"Kırılım gerçekleşti ama fiyat uzaklaştı. Kovalamayın: fiyatın {f(p['hh'])} seviyesine geri dönüp tutunmasını (geri test) bekleyin. Alış {f(p['entry'])} civarı.")
-            elif p["stage"] == "retest":
-                st.success("Fiyat kırılım seviyesine geri döndü ve üstünde tutunuyor: geri test bölgesi.")
-            elif p["stage"] == "fail":
-                st.error("Kırılım başarısız: fiyat seviyenin altına döndü (sahte kırılım).")
-            st.caption(f"⏱ Zaman stopu: {p['max_days']} işlem günü içinde hedefe gitmezse çıkın. Stop’u aşağı çekmeyin.")
+            st.caption(f"Güncel fiyat {f(p['price'])} · veri: {a.get('ts', '—')} taraması · son bar {a['df'].index[-1].date()}")
+            if p["kind"] == "AL":
+                al_ = {"pre": "Alış (kırılım olursa)", "extended": "Alış (geri dönüşte)", "retest": "Alış (şimdi)"}.get(p["stage"], "Alış")
+                c = st.columns(4)
+                c[0].metric("Kırılım seviyesi", f(p["hh"]))
+                c[1].metric(al_, f(p["entry"]))
+                c[2].metric("Stop", f(p["stop"]), pc(p["stop"] / p["entry"] - 1))
+                c[3].metric("Hedef 2R / 3R", f(p["t1"]), f(p["t2"]), delta_color="off")
+                q = lots(capital, risk, p, frac)
+                st.caption(f"Hisse başı risk {f(p['R'])} (%{p['R']/p['entry']*100:.1f}) · Lot: **{q}** · "
+                           f"Maks. kayıp ≈ ${q*p['R']:,.0f} · Pozisyon büyüklüğü ≈ ${q*p['entry']:,.0f}")
+                if p["stage"] == "extended":
+                    st.info(f"Kırılım gerçekleşti ama fiyat uzaklaştı. Kovalamayın: fiyatın {f(p['hh'])} seviyesine geri dönüp tutunmasını (geri test) bekleyin. Alış {f(p['entry'])} civarı.")
+                elif p["stage"] == "retest":
+                    st.success("Fiyat kırılım seviyesine geri döndü ve üstünde tutunuyor: geri test bölgesi.")
+                st.caption(f"⏱ Zaman stopu: {p['max_days']} işlem günü içinde hedefe gitmezse çıkın. Stop’u aşağı çekmeyin.")
+            else:
+                st.info(f"Şu an alım önerilmiyor: {p['label']}. Alış ve stop rakamları yalnızca alım önerisi olan hisselerde gösterilir.")
+                if p["stage"] == "fail":
+                    st.error("Kırılım başarısız: fiyat seviyenin altına döndü (sahte kırılım).")
+                c = st.columns(2)
+                c[0].metric("Güncel fiyat", f(p["price"]))
+                c[1].metric("Kırılım seviyesi", f(p["hh"]), pc(p["price"] / p["hh"] - 1), delta_color="off")
             for w in p["warn"]:
                 st.warning(w, icon="⚠️")
             st.markdown("**Neden bu skor?**")
@@ -902,8 +927,10 @@ with t1:
     if len(L) > 15:
         st.subheader("Diğer hisseler")
         st.dataframe(pd.DataFrame([{"Sembol": s, "Skor": round(a["score"]), "Durum": a["plan"]["label"],
-                                    "Fiyat": a["plan"]["price"], "Kırılım": a["plan"]["hh"], "Alış": a["plan"]["entry"],
-                                    "Stop": a["plan"]["stop"]} for s, a in L[15:]]), hide_index=True, use_container_width=True)
+                                    "Fiyat": f(a["plan"]["price"]), "Kırılım seviyesi": f(a["plan"]["hh"]),
+                                    "Alış": f(a["plan"]["entry"]) if a["plan"]["kind"] == "AL" else "—",
+                                    "Stop": f(a["plan"]["stop"]) if a["plan"]["kind"] == "AL" else "—"} for s, a in L[15:]]),
+                     hide_index=True, use_container_width=True)
     st.caption("Kırılım = önceki 20 günün zirvesi. Alış = kırılımın %0,2 üstü (teyit) ya da uzaklaşmışsa EMA9 geri çekilmesi. "
                "Stop = alış − 1,5×ATR(14). Bu bir yatırım tavsiyesi değildir; geçmiş performans geleceği garanti etmez.")
 
