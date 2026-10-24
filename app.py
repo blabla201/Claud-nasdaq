@@ -179,6 +179,16 @@ def score(df, best_sharpe):
         add(f'Hacim normal ({vr:.1f}x)', 0)
     tl = trendline(df)
     if tl and tl["broken"]: add("Düşen trend çizgisi son 5 günde yukarı kırıldı", 10)
+    wz = whale(df)
+    p_ = float(c.iloc[-1])
+    if wz["buy"] and wz["buy"]["lo"] * 0.98 <= p_ <= wz["buy"]["hi"] * 1.03:
+        add("Hacimli alıcı (balina) bölgesinde ya da hemen üstünde", 10)
+    if wz["sell"] and 0 <= wz["sell"]["lo"] / p_ - 1 <= 0.03:
+        add("Hemen üstte hacimli satıcı bölgesi (direnç)", -10)
+    if wz["ch10"] <= 0.02 and wz["net"] > 0.15:
+        add("Birikim: fiyat durgun ama net alım hacmi yüksek", 10)
+    elif wz["ch10"] >= 0.05 and wz["net"] < -0.1:
+        add("Dağıtım: fiyat yükselirken net satış baskısı", -10)
     if best_sharpe > 0.8:
         add(f'Veri dışı testte strateji Sharpe {best_sharpe:.1f}', 10)
     else:
@@ -186,38 +196,94 @@ def score(df, best_sharpe):
     return float(np.clip(50 + sum(p for _, p in r) / 1.5, 0, 100)), r
 
 def _breakout(df, look=10):
-    """Son `look` gün içindeki ilk kırılım: (konum, seviye) ya da None."""
+    """Son `look` gün içindeki ilk kırılım: (konum, seviye) ya da None. Yalnızca KAPANIŞ tepenin üstündeyse sayılır."""
     c, h, n = df.Close.values, df.hh20.values, len(df)
     for i in range(n - look, n):
         if c[i] > h[i]:
             return i, float(h[i])
     return None
 
+def _disp(df, i, lvl):
+    """Güçlü kırılım (displacement): yeşil, büyük gövdeli mum ve tepenin belirgin üstünde kapanış."""
+    o, c, a = float(df.Open.iloc[i]), float(df.Close.iloc[i]), float(df.atr.iloc[i])
+    return bool(c > o and (c - o) >= 0.8 * a and c >= lvl + 0.3 * a)
+
+def _fvg(df, i):
+    """Yükseliş boşluğu (FVG): bir önceki mumun zirvesi ile bir sonraki mumun dibi arasındaki boşluk."""
+    if i < 1 or i + 1 >= len(df):
+        return None
+    lo, hi = float(df.High.iloc[i - 1]), float(df.Low.iloc[i + 1])
+    return (lo, hi) if hi > lo else None
+
+def _wick_fake(df, bars=3):
+    """Son mumlarda tepenin üstüne yalnızca fitil atıp altında kapanış var mı?"""
+    h, c, lv = df.High.values, df.Close.values, df.hh20.values
+    return any(h[k] > lv[k] and c[k] <= lv[k] for k in range(len(df) - bars, len(df)))
+
+def whale(df, look=40):
+    """Hacim deltası TAHMİNİ (gerçek delta için tik verisi gerekir): kapanışın mum içindeki konumuna göre alım/satım hacmi.
+    Hacimli alıcı (balina alış) ve satıcı (balina satış) bölgelerini ve son 10 günün net alım baskısını bulur."""
+    d = df.tail(look + 20).copy()
+    rng = (d.High - d.Low).replace(0, np.nan)
+    d["delta"] = (d.Volume * ((d.Close - d.Low) - (d.High - d.Close)) / rng).fillna(0)
+    d["vx"] = d.Volume / d.Volume.rolling(20).mean()
+    w = d.tail(look)
+    lo_all, hi_all = float(w.Low.min()), float(w.High.max())
+    span = hi_all - lo_all
+    buy = sell = None
+    cand = w[(w.vx >= 2.0) & (w.delta > 0.3 * w.Volume) & (w.Low <= lo_all + 0.25 * span)]
+    if len(cand):
+        b = cand.loc[cand.Volume.idxmax()]
+        buy = dict(lo=float(b.Low), hi=float((b.Low + b.High) / 2), date=str(b.name.date()))
+    cand = w[(w.vx >= 2.0) & (w.delta < -0.3 * w.Volume) & (w.High >= hi_all - 0.25 * span)]
+    if len(cand):
+        sl = cand.loc[cand.Volume.idxmax()]
+        sell = dict(lo=float((sl.Low + sl.High) / 2), hi=float(sl.High), date=str(sl.name.date()))
+    t10 = d.tail(10)
+    return dict(buy=buy, sell=sell, net=float(t10.delta.sum() / max(t10.Volume.sum(), 1)),
+                ch10=float(d.Close.iloc[-1] / d.Close.iloc[-11] - 1))
+
 def plan(df, sc, mkt_ok=True, maxatr=1.0):
-    """Kırılımı kovalamaz: önce kırılımı bekler, sonra seviyeye geri dönüşü (geri test) bekler."""
+    """Kırılımı kovalamaz. Gerçek kırılım = büyük gövdeli mum tepenin üstünde KAPANIR (fitil sayılmaz).
+    Sonra fiyatın geri dönüşünü bekler: displacement bacağının %50 Fibonacci seviyesi ya da kırılım seviyesi."""
     last = df.iloc[-1]
     c, a = float(last.Close), float(last.atr)
     atrp = a / c
     bo = _breakout(df)
     warn = []
+    disp_ok = fvg = fib50 = leg_low = leg_high = None
+    wick = False
     if bo is None:
         stage, lvl = "pre", float(last.hh20)
         entry = lvl * 1.002
         stop = entry - 1.5 * a
+        wick = _wick_fake(df)
+        if wick:
+            warn.append("Tepenin üstüne yalnızca fitil attı, mum üstünde kapanmadı: bu gerçek kırılım değil")
     else:
         i, lvl = bo
+        disp_ok = _disp(df, i, lvl)
+        fvg = _fvg(df, i)
+        leg_low = float(df.Low.iloc[max(0, i - 10):i + 1].min())
+        leg_high = float(df.High.iloc[i:].max())
+        fib50 = leg_low + 0.5 * (leg_high - leg_low)
         if c < lvl * 0.99:
             stage = "fail"; entry = float(last.hh20) * 1.002; stop = entry - 1.5 * a
             warn.append("Sahte kırılım: fiyat kırılım seviyesinin altına döndü")
         else:
             stage = "retest" if c <= lvl * 1.02 else "extended"
-            entry = c if stage == "retest" else lvl * 1.005
+            if stage == "retest":
+                entry = c
+            else:
+                entry = min(c, max(lvl * 1.005, fib50)) if disp_ok else lvl * 1.005
             stop = min(lvl - 1.0 * a, entry - 0.5 * a)
             if stage == "extended":
-                warn.append("Kırılım gerçekleşti ama fiyat uzaklaştı: kovalamayın, seviyeye geri dönüşü (geri test) bekleyin")
+                warn.append("Kırılım gerçekleşti ama fiyat uzaklaştı: kovalamayın, geri dönüşü bekleyin")
             vol = float(df.Volume.iloc[i]); avg = float(df.Volume.iloc[max(0, i - 20):i].mean()) or 1.0
             if vol < avg:
                 warn.append("Kırılım ortalamanın altında hacimle geldi: zayıf kırılım")
+            if not disp_ok:
+                warn.append("Zayıf kırılım: büyük gövdeli mum ve tepenin belirgin üstünde kapanış yok, gerçek kırılım olmayabilir")
     R = entry - stop
     if last.rsi > 75: warn.append("RSI aşırı alım bölgesinde")
     if c < last.vw: warn.append("Fiyat VWAP altında")
@@ -225,19 +291,27 @@ def plan(df, sc, mkt_ok=True, maxatr=1.0):
     if R / entry > .06: warn.append(f"Stop mesafesi geniş (%{R/entry*100:.1f})")
     if atrp > maxatr: warn.append(f"Aşırı oynak: günlük ortalama hareket %{atrp*100:.1f}")
     if not mkt_ok: warn.append("Piyasa filtresi: QQQ düşüş trendinde, yeni alım önerilmez")
+    weak = bo is not None and stage != "fail" and not disp_ok
     blocked = atrp > maxatr or not mkt_ok
-    strong = sc >= 70 and c > last.e21 and stage != "fail"
+    strong = sc >= 70 and c > last.e21 and stage != "fail" and not weak and not wick
     kind = "AL" if strong and not blocked else "IZLE" if sc >= 50 else "UZAK"
     if stage == "fail":
         label = "SAHTE KIRILIM"
+    elif kind == "UZAK":
+        label = "UZAK DUR"
+    elif wick:
+        label = "FİTİL: KIRILIM DEĞİL"
+    elif weak:
+        label = "ZAYIF KIRILIM"
     elif kind == "AL":
         label = {"pre": f"KIRILIMI BEKLE (%{(lvl/c-1)*100:.1f} uzakta)",
-                 "extended": f"GERİ TEST BEKLE (seviye ${lvl:.2f})",
+                 "extended": f"GERİ DÖNÜŞÜ BEKLE (seviye ${lvl:.2f})",
                  "retest": "GERİ TEST BÖLGESİ: ALIM"}[stage]
     else:
-        label = ("İZLE (filtre)" if strong and blocked else "İZLE") if kind == "IZLE" else "UZAK DUR"
+        label = "İZLE (filtre)" if strong and blocked else "İZLE"
     return dict(price=c, hh=lvl, entry=entry, stop=stop, R=R, t1=entry + 2 * R, t2=entry + 3 * R,
-                kind=kind, label=label, warn=warn, done=stage in ("extended", "retest"), stage=stage, atrp=atrp, max_days=10)
+                kind=kind, label=label, warn=warn, done=stage in ("extended", "retest"), stage=stage, atrp=atrp, max_days=10,
+                fib50=fib50, leg_low=leg_low, leg_high=leg_high, fvg=fvg, disp_ok=disp_ok, wick=wick)
 
 def lots(capital, risk_pct, p, fractional=False):
     """Risk yüzdesine göre adet. fractional=True: parçalı (kesirli) hisse alınabilir."""
@@ -697,7 +771,7 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", p
             bt = run_all(df, cost)
             o = oos(bt)
             sc, why = score(df, o["test_sh"])
-            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr), trend=trendline(df),
+            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr), trend=trendline(df), whale=whale(df),
                        ts=time.strftime("%d.%m %H:%M UTC", time.gmtime()))
         except Exception:
             continue
@@ -718,7 +792,7 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", p
     return A, new, info, (mkt_ok, mkt_txt)
 
 # ===== ARAYÜZ =====
-SURUM = "v10 (tek dosya)"
+SURUM = "v11 (tek dosya)"
 
 
 
@@ -897,6 +971,11 @@ with t1:
         icon = "🟢" if p["kind"] == "AL" else "🟡" if p["kind"] == "IZLE" else "🔴"
         with st.expander(f"{icon} {s} · {f(p['price'])} · skor {a['score']:.0f} · {p['label']}", expanded=p["kind"] == "AL"):
             st.caption(f"Güncel fiyat {f(p['price'])} · veri: {a.get('ts', '—')} taraması · son bar {a['df'].index[-1].date()}")
+            wz_ = a.get("whale") or {}
+            if wz_.get("buy") or wz_.get("sell"):
+                st.caption("Balina bölgeleri (hacim deltası tahmini): " +
+                           (f"alış {f(wz_['buy']['lo'])}–{f(wz_['buy']['hi'])} " if wz_.get("buy") else "") +
+                           (f"· satış {f(wz_['sell']['lo'])}–{f(wz_['sell']['hi'])}" if wz_.get("sell") else ""))
             if p["kind"] == "AL":
                 al_ = {"pre": "Alış (kırılım olursa)", "extended": "Alış (geri dönüşte)", "retest": "Alış (şimdi)"}.get(p["stage"], "Alış")
                 c = st.columns(4)
@@ -911,6 +990,9 @@ with t1:
                     st.info(f"Kırılım gerçekleşti ama fiyat uzaklaştı. Kovalamayın: fiyatın {f(p['hh'])} seviyesine geri dönüp tutunmasını (geri test) bekleyin. Alış {f(p['entry'])} civarı.")
                 elif p["stage"] == "retest":
                     st.success("Fiyat kırılım seviyesine geri döndü ve üstünde tutunuyor: geri test bölgesi.")
+                if p.get("fib50") and p["stage"] != "pre":
+                    st.caption(f"Fibonacci %50 (kırılım bacağının ortası): {f(p['fib50'])} · bacağın zirvesi: {f(p['leg_high'])}"
+                               + (f" · kırılımın bıraktığı boşluk (FVG): {f(p['fvg'][0])}–{f(p['fvg'][1])}" if p.get("fvg") else ""))
                 st.caption(f"⏱ Zaman stopu: {p['max_days']} işlem günü içinde hedefe gitmezse çıkın. Stop’u aşağı çekmeyin.")
             else:
                 st.info(f"Şu an alım önerilmiyor: {p['label']}. Alış ve stop rakamları yalnızca alım önerisi olan hisselerde gösterilir.")
@@ -952,6 +1034,11 @@ with t2:
         fig.add_scatter(x=[a["df"].index[x0], a["df"].index[x1]], y=[tl["y1"] + tl["m"] * (x0 - tl["i1"]), tl["y1"] + tl["m"] * (x1 - tl["i1"])],
                         name="Düşen trend çizgisi", line=dict(color="#f5b942", dash="dash", width=1.5))
     fig.add_hline(y=a["plan"]["hh"], line_dash="dot", line_color="#4d8dff", annotation_text="Kırılım seviyesi")
+    wz = a.get("whale") or {}
+    if wz.get("buy"):
+        fig.add_hrect(y0=wz["buy"]["lo"], y1=wz["buy"]["hi"], fillcolor="rgba(34,197,139,.18)", line_width=0, annotation_text="Balina alış bölgesi")
+    if wz.get("sell"):
+        fig.add_hrect(y0=wz["sell"]["lo"], y1=wz["sell"]["hi"], fillcolor="rgba(255,93,115,.18)", line_width=0, annotation_text="Balina satış bölgesi")
     fig.add_scatter(x=ent.index, y=ent.Low * .985, mode="markers", name="Alım", marker=dict(symbol="triangle-up", size=11, color="#22c58b"))
     fig.add_scatter(x=ext.index, y=ext.High * 1.015, mode="markers", name="Satım", marker=dict(symbol="triangle-down", size=11, color="#ff5d73"))
     st.plotly_chart(layout(fig, 430), use_container_width=True)
