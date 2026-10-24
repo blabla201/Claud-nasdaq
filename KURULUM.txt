@@ -1,0 +1,15 @@
+LAB NASDAQ - SIFIRDAN KURULUM (yalnizca 2 dosya yuklenir)
+
+GITHUB'A YUKLENECEK DOSYALAR:  app.py  ve  requirements.txt
+
+1) github.com -> sag ustte + -> New repository
+   Repository name: lab-nasdaq   |  Public   |  Create repository
+2) Bos depoda "uploading an existing file" yazisina dokunun
+   (gorunmuyorsa Safari: aA -> Masaustu Sitesini Iste -> Add file -> Upload files)
+3) app.py ve requirements.txt dosyalarini secin -> Commit changes
+4) share.streamlit.io -> Continue with GitHub -> Create app -> Deploy a public app from GitHub
+   Repository: <kullanici adiniz>/lab-nasdaq   Branch: main   Main file path: app.py
+   Deploy'a basin (2-5 dakika)
+5) Acilan sayfanin adresi (....streamlit.app) sizin linkinizdir.
+   Paylas simgesi -> Ana Ekrana Ekle. Linki Notlar'a da kaydedin.
+Sayfada "Lab Nasdaq" ve "Surum: v10 (tek dosya)" yazmali.
